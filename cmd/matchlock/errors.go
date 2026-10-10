@@ -40,7 +40,8 @@ var (
 
 // Pull errors
 var (
-	ErrSaveTag = errors.New("saving tag")
+	ErrSaveTag            = errors.New("saving tag")
+	ErrInvalidPullTimeout = errors.New("invalid pull timeout")
 )
 
 // Kernel errors
