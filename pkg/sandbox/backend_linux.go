@@ -132,6 +132,20 @@ func defaultVMBackendFactory(kind backendKind) vm.Backend {
 	}
 }
 
+// defaultVMBackend is the seam New() builds its backend through. Tests replace
+// it with a fake so the create flow (including failures after the machine
+// boundary) can run without a hypervisor.
+var defaultVMBackend vmBackendFactory = defaultVMBackendFactory
+
+// checkKVMAvailability and qemuFallbackAvailable are the seams for the two
+// backend-selection inputs. They are variables (not direct calls) so unit tests
+// can select a backend without opening /dev/kvm or /dev/vhost-vsock on the test
+// host. Production always uses the real probes.
+var (
+	checkKVMAvailability  = kvm.Check
+	qemuFallbackAvailable = qemuAvailable
+)
+
 const vhostVsockPath = "/dev/vhost-vsock"
 
 // vhostVsockAccessible checks that the vhost-vsock device exists and is usable

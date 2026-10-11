@@ -3,6 +3,7 @@ package sandbox
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 	"github.com/jingkaihe/matchlock/pkg/api"
 	sandboxnet "github.com/jingkaihe/matchlock/pkg/net"
 	"github.com/jingkaihe/matchlock/pkg/policy"
+	"github.com/jingkaihe/matchlock/pkg/state"
 	"github.com/jingkaihe/matchlock/pkg/vfs"
 	"github.com/jingkaihe/matchlock/pkg/vm"
 	"github.com/jingkaihe/matchlock/pkg/vsock"
@@ -308,4 +310,60 @@ func flushGuestDisks(machine vm.Machine) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	_, _ = machine.Exec(ctx, "sync", &api.ExecOptions{})
+}
+
+// createRollback removes the VM registry row and the per-VM state directory of
+// a create attempt that fails before the backend machine is created. Such an
+// attempt never produced a bootable VM, so leaving a registry row behind turns
+// a transient create failure into a phantom VM that only `matchlock prune`
+// could ever clear.
+//
+// The boundary sits at the backend.Create call, not after it: from the moment
+// the backend starts acquiring host resources (a persistent TAP, a QEMU CID
+// lock, a temp rootfs copy) the registry row is the only handle reconcile/gc
+// has for cleaning them up, and the backends' own teardown inside Create is
+// best-effort (the TAP-delete error there is discarded). So a backend.Create
+// failure keeps the row (marked stopped by the platform cleanup path), while
+// every failure strictly before it - bootstrap/upper-disk provisioning, CA
+// injection, subnet allocation, kernel resolution, swap/extra-disk setup - is
+// fully rolled back.
+type createRollback struct {
+	stateMgr  *state.Manager
+	id        string
+	committed bool
+}
+
+func newCreateRollback(stateMgr *state.Manager, id string) *createRollback {
+	return &createRollback{stateMgr: stateMgr, id: id}
+}
+
+// commit marks the machine boundary as crossed: rollback stops deleting.
+func (r *createRollback) commit() { r.committed = true }
+
+// run is the constructor's deferred entry point. It returns retErr unchanged
+// (a nil error means create succeeded and nothing is rolled back). A rollback
+// failure is joined so it is reported without masking the original create
+// error.
+func (r *createRollback) run(retErr error) error {
+	if retErr == nil || r.committed {
+		return retErr
+	}
+	if rbErr := removeFailedCreateRecord(r.stateMgr, r.id); rbErr != nil {
+		return errors.Join(retErr, rbErr)
+	}
+	return retErr
+}
+
+// removeFailedCreateRecord deletes the registry row, its subnet allocation and
+// the per-VM state directory for a create attempt that never reached the
+// machine boundary. The row is first marked stopped (Unregister) because
+// Remove refuses to delete a row that still looks like a live running VM.
+func removeFailedCreateRecord(stateMgr *state.Manager, id string) error {
+	if err := stateMgr.Unregister(id); err != nil {
+		return errx.Wrap(ErrRemoveFailedCreate, err)
+	}
+	if err := stateMgr.Remove(id); err != nil {
+		return errx.Wrap(ErrRemoveFailedCreate, err)
+	}
+	return nil
 }

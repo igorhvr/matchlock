@@ -14,7 +14,6 @@ import (
 
 	"github.com/jingkaihe/matchlock/internal/errx"
 	"github.com/jingkaihe/matchlock/pkg/api"
-	"github.com/jingkaihe/matchlock/pkg/kvm"
 	"github.com/jingkaihe/matchlock/pkg/lifecycle"
 	sandboxnet "github.com/jingkaihe/matchlock/pkg/net"
 	"github.com/jingkaihe/matchlock/pkg/policy"
@@ -230,24 +229,28 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
 	if err := stateMgr.Register(id, config); err != nil {
 		return nil, errx.Wrap(ErrRegisterState, err)
 	}
+	// Any create failure before the backend machine exists must not leave a
+	// permanent VM record: the attempt never produced a bootable VM, so its
+	// registry row and state directory are removed. Commit the boundary just
+	// before backend.Create, after which the existing (stopped-row) recovery
+	// semantics for machine-related failures stay in force.
+	rollback := newCreateRollback(stateMgr, id)
+	defer func() { retErr = rollback.run(retErr) }()
 	lifecycleStore := lifecycle.NewStore(stateMgr.Dir(id))
 
 	// Choose the VM backend before initializing the lifecycle record so its
 	// backend label is accurate. Prefer the KVM-accelerated Firecracker backend
 	// and fall back to QEMU TCG only when KVM is definitively unavailable.
-	backendKind, selectionErr := selectBackendKind(kvm.Check(), qemuAvailable)
+	backendKind, selectionErr := selectBackendKind(checkKVMAvailability(), qemuFallbackAvailable)
 	if selectionErr != nil {
-		stateMgr.Unregister(id)
 		return nil, errx.Wrap(ErrCreateVM, selectionErr)
 	}
 	// Validate backend constraints before provisioning networking or injecting
 	// certificates so unsupported configurations fail without resource side effects.
 	if err := validateBackendConstraints(backendKind, config); err != nil {
-		stateMgr.Unregister(id)
 		return nil, errx.Wrap(ErrCreateVM, err)
 	}
 	if err := lifecycleStore.Init(id, backendKind.String(), stateMgr.Dir(id)); err != nil {
-		stateMgr.Unregister(id)
 		return nil, errx.Wrap(ErrLifecycleInit, err)
 	}
 	_ = lifecycleStore.SetResource(func(r *lifecycle.Resources) {
@@ -277,9 +280,8 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
 		}
 	}()
 
-	if err := createBootstrapRootfs(bootstrapRootfsPath); err != nil {
+	if err := createBootstrapRootfsFn(bootstrapRootfsPath); err != nil {
 		cleanupRootDisks()
-		stateMgr.Unregister(id)
 		return nil, errx.Wrap(ErrPrepareBootstrapRoot, err)
 	}
 
@@ -287,14 +289,12 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
 	if config.Resources != nil && config.Resources.DiskSizeMB > 0 {
 		diskSizeMB = int64(config.Resources.DiskSizeMB)
 	}
-	if err := createExt4Image(upperRootfsPath, diskSizeMB); err != nil {
+	if err := createExt4ImageFn(upperRootfsPath, diskSizeMB); err != nil {
 		cleanupRootDisks()
-		stateMgr.Unregister(id)
 		return nil, errx.Wrap(ErrCreateRootfs, err)
 	}
-	if err := prepareOverlayUpperRootfs(upperRootfsPath); err != nil {
+	if err := prepareOverlayUpperRootfsFn(upperRootfsPath); err != nil {
 		cleanupRootDisks()
-		stateMgr.Unregister(id)
 		return nil, errx.Wrap(ErrPrepareRootfs, err)
 	}
 	_ = lifecycleStore.SetResource(func(r *lifecycle.Resources) {
@@ -307,12 +307,10 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
 	}
 	vcpus, ok := api.VCPUCount(config.Resources.CPUs)
 	if !ok {
-		stateMgr.Unregister(id)
 		return nil, errx.With(ErrCreateVM, ": cpus must be a finite number > 0")
 	}
 	hostCPUs := runtime.NumCPU()
 	if vcpus > hostCPUs {
-		stateMgr.Unregister(id)
 		return nil, errx.With(ErrCreateVM, ": cpus must be <= host cpus (%d)", hostCPUs)
 	}
 
@@ -324,12 +322,10 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
 		caPool, err = sandboxnet.NewCAPool()
 		if err != nil {
 			cleanupRootDisks()
-			stateMgr.Unregister(id)
 			return nil, errx.Wrap(ErrCreateCAPool, err)
 		}
 		if err := injectConfigFileIntoRootfs(upperRootfsPath, "/upper/etc/ssl/certs/matchlock-ca.crt", caPool.CACertPEM()); err != nil {
 			cleanupRootDisks()
-			stateMgr.Unregister(id)
 			return nil, errx.Wrap(ErrInjectCACert, err)
 		}
 	}
@@ -351,7 +347,6 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
 		subnetInfo, err = subnetAlloc.Allocate(id)
 		if err != nil {
 			cleanupRootDisks()
-			stateMgr.Unregister(id)
 			return nil, errx.Wrap(ErrAllocateSubnet, err)
 		}
 		_ = lifecycleStore.SetResource(func(r *lifecycle.Resources) {
@@ -367,20 +362,18 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
 	// unchanged.
 	wiring := newInterceptionWiring(subnetInfo, needsProxy)
 
-	backend := defaultVMBackendFactory(backendKind)
+	backend := defaultVMBackend(backendKind)
 
 	kernelPath, err := resolveLinuxKernelForConfig(ctx, config, opts, lifecycleStore, backendKind)
 	if err != nil {
 		releaseSubnet()
 		cleanupRootDisks()
-		stateMgr.Unregister(id)
 		return nil, errx.Wrap(ErrCreateVM, err)
 	}
 
 	extraDisks, err := buildExtraDiskConfigs(config.ExtraDisks)
 	if err != nil {
 		releaseSubnet()
-		stateMgr.Unregister(id)
 		return nil, err
 	}
 	if config.Resources != nil && config.Resources.SwapMB > 0 {
@@ -388,7 +381,6 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
 	}
 	if err := validateOverlayDiskLayout(len(opts.RootfsPaths), len(extraDisks), swapPath != ""); err != nil {
 		releaseSubnet()
-		stateMgr.Unregister(id)
 		return nil, err
 	}
 	if swapPath != "" {
@@ -396,7 +388,6 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
 		if err != nil {
 			cleanupRootDisks()
 			releaseSubnet()
-			stateMgr.Unregister(id)
 			return nil, err
 		}
 		extraDisks = append(extraDisks, swapDisk)
@@ -446,6 +437,9 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
 	// --no-network.
 	wiring.applyToVMConfig(vmConfig)
 
+	// Machine boundary: from here on a failure keeps the (stopped) record so
+	// reconcile/gc can still find the host resources the machine may hold.
+	rollback.commit()
 	machine, err := backend.Create(ctx, vmConfig)
 	if err != nil {
 		cleanupRootDisks()

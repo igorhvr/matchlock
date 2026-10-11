@@ -52,6 +52,12 @@ type Options struct {
 	RootfsFSTypes []string // Optional fs type per lower image (defaults to erofs).
 }
 
+// newDarwinVMBackend builds the backend a create attempt uses. It is a seam:
+// unit tests substitute a stub so the create-failure rollback can be exercised
+// without reaching the hypervisor. Production always builds the
+// Virtualization.framework backend.
+var newDarwinVMBackend = func() vm.Backend { return darwin.NewDarwinBackend() }
+
 func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, retErr error) {
 	if opts == nil {
 		opts = &Options{}
@@ -85,9 +91,15 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
 	if err := stateMgr.Register(id, config); err != nil {
 		return nil, errx.Wrap(ErrRegisterState, err)
 	}
+	// Any create failure before the backend machine exists must not leave a
+	// permanent VM record: the attempt never produced a bootable VM, so its
+	// registry row and state directory are removed. Commit the boundary just
+	// before backend.Create, after which the existing (stopped-row) recovery
+	// semantics for machine-related failures stay in force.
+	rollback := newCreateRollback(stateMgr, id)
+	defer func() { retErr = rollback.run(retErr) }()
 	lifecycleStore := lifecycle.NewStore(stateMgr.Dir(id))
 	if err := lifecycleStore.Init(id, "virtualization.framework", stateMgr.Dir(id)); err != nil {
-		stateMgr.Unregister(id)
 		return nil, errx.Wrap(ErrLifecycleInit, err)
 	}
 	_ = lifecycleStore.SetResource(func(r *lifecycle.Resources) {
@@ -115,7 +127,6 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
 		subnetAlloc = state.NewSubnetAllocator()
 		subnetInfo, err = subnetAlloc.Allocate(id)
 		if err != nil {
-			stateMgr.Unregister(id)
 			return nil, errx.Wrap(ErrAllocateSubnet, err)
 		}
 		_ = lifecycleStore.SetResource(func(r *lifecycle.Resources) {
@@ -125,12 +136,11 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
 		})
 	}
 
-	backend := darwin.NewDarwinBackend()
+	backend := newDarwinVMBackend()
 
 	kernelPath, err := resolveKernelForConfig(ctx, config, opts, lifecycleStore)
 	if err != nil {
 		releaseSubnet()
-		stateMgr.Unregister(id)
 		return nil, errx.Wrap(ErrCreateVM, err)
 	}
 	rootfsPaths := opts.RootfsPaths
@@ -160,29 +170,25 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
 		caPool, err = sandboxnet.NewCAPool()
 		if err != nil {
 			releaseSubnet()
-			stateMgr.Unregister(id)
 			return nil, errx.Wrap(ErrCreateCAPool, err)
 		}
 	}
 
 	// Prepare bootstrap root disk (vda) and writable upper disk for overlay root.
-	if err := createBootstrapRootfs(bootstrapRootfsPath); err != nil {
+	if err := createBootstrapRootfsFn(bootstrapRootfsPath); err != nil {
 		releaseSubnet()
-		stateMgr.Unregister(id)
 		return nil, errx.Wrap(ErrPrepareBootstrapRoot, err)
 	}
 	var diskSizeMB int64 = api.DefaultDiskSizeMB
 	if config.Resources != nil && config.Resources.DiskSizeMB > 0 {
 		diskSizeMB = int64(config.Resources.DiskSizeMB)
 	}
-	if err := createExt4Image(upperRootfsPath, diskSizeMB); err != nil {
+	if err := createExt4ImageFn(upperRootfsPath, diskSizeMB); err != nil {
 		releaseSubnet()
-		stateMgr.Unregister(id)
 		return nil, errx.Wrap(ErrCreateRootfs, err)
 	}
-	if err := prepareOverlayUpperRootfs(upperRootfsPath); err != nil {
+	if err := prepareOverlayUpperRootfsFn(upperRootfsPath); err != nil {
 		releaseSubnet()
-		stateMgr.Unregister(id)
 		return nil, errx.Wrap(ErrPrepareRootfs, err)
 	}
 	_ = lifecycleStore.SetResource(func(r *lifecycle.Resources) {
@@ -193,7 +199,6 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
 	if caPool != nil {
 		if err := injectConfigFileIntoRootfs(upperRootfsPath, "/upper/etc/ssl/certs/matchlock-ca.crt", caPool.CACertPEM()); err != nil {
 			releaseSubnet()
-			stateMgr.Unregister(id)
 			return nil, errx.Wrap(ErrInjectCACert, err)
 		}
 	}
@@ -201,7 +206,6 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
 	extraDisks, err := buildExtraDiskConfigs(config.ExtraDisks)
 	if err != nil {
 		releaseSubnet()
-		stateMgr.Unregister(id)
 		return nil, err
 	}
 	if config.Resources != nil && config.Resources.SwapMB > 0 {
@@ -209,7 +213,6 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
 	}
 	if err := validateOverlayDiskLayout(len(rootfsPaths), len(extraDisks), swapPath != ""); err != nil {
 		releaseSubnet()
-		stateMgr.Unregister(id)
 		return nil, err
 	}
 	if swapPath != "" {
@@ -217,7 +220,6 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
 		if err != nil {
 			cleanupRootDisks()
 			releaseSubnet()
-			stateMgr.Unregister(id)
 			return nil, err
 		}
 		extraDisks = append(extraDisks, swapDisk)
@@ -269,10 +271,12 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
 	overlaySnapshots, err := prepareOverlaySnapshots(config, stateMgr.Dir(id))
 	if err != nil {
 		releaseSubnet()
-		stateMgr.Unregister(id)
 		return nil, err
 	}
 
+	// Machine boundary: from here on a failure keeps the (stopped) record so
+	// reconcile/gc can still find the host resources the machine may hold.
+	rollback.commit()
 	machine, err := backend.Create(ctx, vmConfig)
 	if err != nil {
 		releaseSubnet()

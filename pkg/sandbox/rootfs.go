@@ -13,6 +13,16 @@ import (
 
 const defaultBootstrapRootfsMB = 64
 
+// Create-time provisioning seams. New() (linux and darwin) calls the disk
+// provisioning helpers through these variables so create-failure rollback can
+// be driven deterministically in unit tests without mke2fs, debugfs or a real
+// VM. Production always uses the defaults.
+var (
+	createBootstrapRootfsFn     = createBootstrapRootfs
+	createExt4ImageFn           = createExt4Image
+	prepareOverlayUpperRootfsFn = prepareOverlayUpperRootfs
+)
+
 // swapPageSize is the guest page size assumed by the Linux version-1 swap
 // header. x86_64 is always 4K; arm64 is pinned to 4K via CONFIG_ARM64_4K_PAGES.
 const swapPageSize = 4096
