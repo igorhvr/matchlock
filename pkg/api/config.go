@@ -168,7 +168,9 @@ type NetworkConfig struct {
 	// record, so a dual-stack guest resolves and connects over IPv4; "ipv6"
 	// relays every DNS answer verbatim. "ipv6" is verbatim DNS relay only: it
 	// is not "force applications to prefer IPv6", and direct IP-literal
-	// connections are unaffected by either value.
+	// connections are unaffected by either value. The settings apply to
+	// intercepted sandboxes on every backend; a plain-NAT or --no-network
+	// sandbox is unaffected.
 	DNSPriority string `json:"dns_priority,omitempty"`
 }
 

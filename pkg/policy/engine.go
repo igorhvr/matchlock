@@ -902,10 +902,9 @@ func (e *Engine) allowPrivateNameAddress(ip net.IP, port int) bool {
 // IGNORED because a DNS query carries no port. Address entries (IP literals,
 // CIDR networks) never match a name.
 //
-// It exists so the sandbox can hand the DNS forwarder's ipv4-preferring AAAA
-// rewrite a fail-closed allow_private carve-out: a name exempted here is
-// relayed verbatim. With no allow_private entries it returns false — the
-// rewrite stays enabled.
+// It exists so a DNS resolver can implement the allow_private carve-out of the
+// dns_priority contract: a name exempted here is always relayed verbatim. With
+// no allow_private entries it returns false — the rewrite stays enabled.
 func (e *Engine) MatchesAllowPrivateName(host string) bool {
 	name := normalizeDNSName(host)
 	if name == "" {

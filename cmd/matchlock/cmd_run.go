@@ -221,8 +221,9 @@ func buildRunResources(cpus float64, memoryMB, diskSizeMB, timeoutSeconds, swapM
 // booting a sandbox.
 //
 // prioritizeIPv4DNS/prioritizeIPv6DNS are the DNS resolution priority flags;
-// when both are given IPv6 wins, and when neither is given the config carries
-// the explicit default "ipv4".
+// when both are given IPv6 wins (the non-default flag wins, mirroring the
+// --no-swap/--swap precedent), and when neither is given the config carries the
+// explicit default "ipv4".
 func buildRunNetworkConfig(
 	allowHosts []string,
 	addHosts []api.HostIPMapping,

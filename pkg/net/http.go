@@ -19,14 +19,20 @@ type HTTPInterceptor struct {
 	events   chan api.Event
 	caPool   *CAPool
 	connPool *upstreamConnPool
-	// gatewayIP is the guest-visible virtual gateway of the darwin userspace
-	// network stack. On darwin that address is assigned to the netstack NIC but
-	// is NOT bound on the host (there is no TAP), so a dial to it can never
-	// connect. When it is set, a policy-verified dial address equal to it is
-	// mapped to host loopback (see mapGatewayDialHost). It is left empty by
-	// NewHTTPInterceptor, so the Linux TransparentProxy path dials every
-	// destination literally: its TAP gateway IS a real host address.
+	// gatewayIP is the guest-visible virtual IPv4 gateway of the darwin
+	// userspace network stack. On darwin that address is assigned to the
+	// netstack NIC but is NOT bound on the host (there is no TAP), so a dial to
+	// it can never connect. When it is set, a policy-verified dial address
+	// equal to it is mapped to host loopback (see mapGatewayDialHost). It is
+	// left empty by NewHTTPInterceptor, so the Linux TransparentProxy path
+	// dials every destination literally: its TAP gateway IS a real host
+	// address.
 	gatewayIP string
+	// gatewayIPv6 is the guest-visible virtual IPv6 gateway of the same stack
+	// (the per-VM ULA gateway the guest routes ::/0 through). It maps to host
+	// ::1 under the identical policy-first ordering; empty when the sandbox
+	// wired no IPv6 link or on Linux.
+	gatewayIPv6 string
 	// dial is used for upstream connections. It defaults to a 30s timeout dial
 	// and is a seam for tests that need to observe the dial target or avoid real
 	// network traffic.
@@ -155,10 +161,10 @@ func (i *HTTPInterceptor) HandleHTTP(guestConn net.Conn, dstIP string, dstPort i
 		}
 
 		// The policy decision above is on the guest-visible host; only the dial
-		// target is mapped, and only on darwin (empty gatewayIP elsewhere), so an
-		// allowlisted gateway reaches a host listener while an unallowlisted one
-		// is still refused before this point.
-		targetHost := resolvePassthroughTarget(dialIP.String(), dstPort, i.gatewayIP)
+		// target is mapped, and only on darwin (empty gateways elsewhere), so
+		// an allowlisted gateway reaches a host listener while an
+		// unallowlisted one is still refused before this point.
+		targetHost := resolvePassthroughTarget(dialIP.String(), dstPort, i.gatewayIP, i.gatewayIPv6)
 
 		// Try to reuse an existing upstream connection from the pool.
 		pc := i.connPool.get(targetHost)
@@ -272,7 +278,7 @@ func (i *HTTPInterceptor) HandleHTTPS(guestConn net.Conn, dstIP string, dstPort 
 	// the original serverName as SNI, and the blocked event above names the
 	// original SNI host. On darwin an allowlisted gateway maps to host loopback;
 	// elsewhere (empty gatewayIP) the literal verified address is dialed.
-	rawConn, err := i.dial("tcp", resolvePassthroughTarget(dialIP.String(), dstPort, i.gatewayIP))
+	rawConn, err := i.dial("tcp", resolvePassthroughTarget(dialIP.String(), dstPort, i.gatewayIP, i.gatewayIPv6))
 	if err != nil {
 		return
 	}

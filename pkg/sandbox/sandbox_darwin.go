@@ -225,14 +225,12 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
 		extraDisks = append(extraDisks, swapDisk)
 	}
 
-	gatewayIP := ""
-	guestIP := ""
-	subnetCIDR := ""
-	if subnetInfo != nil {
-		gatewayIP = subnetInfo.GatewayIP
-		guestIP = subnetInfo.GuestIP
-		subnetCIDR = subnetInfo.GatewayIP + "/24"
-	}
+	// networkLink carries the per-VM addressing both network consumers need:
+	// the VMConfig (guest kernel arguments) and the interception stack's
+	// Config. IPv6 fields are populated only for intercepted sandboxes,
+	// mirroring the Linux interceptionWiring gate - a plain NAT guest keeps
+	// the IPv4-only shape, and --no-network has no lease at all.
+	networkLink := newSandboxNetLink(subnetInfo, needsInterception)
 
 	vmConfig := &vm.VMConfig{
 		ID:                  id,
@@ -246,9 +244,12 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
 		MemoryMB:            config.Resources.MemoryMB,
 		SocketPath:          stateMgr.SocketPath(id) + ".sock",
 		LogPath:             stateMgr.LogPath(id),
-		GatewayIP:           gatewayIP,
-		GuestIP:             guestIP,
-		SubnetCIDR:          subnetCIDR,
+		GatewayIP:           networkLink.GatewayIPv4,
+		GuestIP:             networkLink.GuestIPv4,
+		SubnetCIDR:          networkLink.SubnetCIDR,
+		GatewayIPv6:         networkLink.GatewayIPv6,
+		GuestIPv6:           networkLink.GuestIPv6,
+		Subnet6CIDR:         networkLink.Subnet6CIDR,
 		Workspace:           workspace,
 		ExactMounts:         exactFUSEMountpoints(config),
 		UseInterception:     needsInterception,
@@ -316,14 +317,24 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
 		}
 
 		netStack, err = sandboxnet.NewNetworkStack(&sandboxnet.Config{
-			File:       networkFile,
-			GatewayIP:  gatewayIP,
-			GuestIP:    guestIP,
-			MTU:        uint32(config.Network.GetMTU()),
-			Policy:     policyEngine,
-			Events:     events,
-			CAPool:     caPool,
-			DNSServers: config.Network.GetDNSServers(),
+			File:        networkFile,
+			GatewayIP:   networkLink.GatewayIPv4,
+			GuestIP:     networkLink.GuestIPv4,
+			GatewayIPv6: networkLink.GatewayIPv6,
+			GuestIPv6:   networkLink.GuestIPv6,
+			Subnet6CIDR: networkLink.Subnet6CIDR,
+			MTU:         uint32(config.Network.GetMTU()),
+			Policy:      policyEngine,
+			Events:      events,
+			CAPool:      caPool,
+			DNSServers:  config.Network.GetDNSServers(),
+			// The DNS answer-mode contract (network.dns_priority) applies to
+			// the darwin userspace resolver exactly as it does to the Linux
+			// forwarder: "ipv4" (default) prefers IPv4, "ipv6" relays
+			// verbatim; allow_private names are always verbatim. A stack
+			// construction failure aborts sandbox creation (fail closed) -
+			// never a silent fallback to VZ NAT or an IPv4-only stack.
+			DNSPriority: config.Network.GetDNSPriority(),
 		})
 		if err != nil {
 			machine.Close(ctx)
