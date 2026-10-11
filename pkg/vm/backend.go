@@ -117,15 +117,26 @@ type VsockDialer interface {
 }
 
 // KernelIPDNSSuffix returns the DNS portion of the kernel ip= parameter.
-// The ip= format only supports up to 2 DNS servers (`:dns0:dns1`).
+// The ip= format only supports up to 2 DNS servers (`:dns0:dns1`) and is
+// colon-delimited, so only entries without a colon (IPv4 literals) may travel
+// in it: an IPv6 literal's colons would corrupt the fields that follow it in
+// the ip= argument. Entries containing a colon are skipped here; the full
+// resolver list — including IPv6 resolvers — still travels in matchlock.dns=
+// (KernelDNSParam), which guest-init consumes. The default servers are IPv4,
+// so an unconfigured or IPv4-only sandbox renders byte-identically to before.
 func KernelIPDNSSuffix(dnsServers []string) string {
 	var sb strings.Builder
-	for i, s := range dnsServers {
-		if i >= 2 {
+	written := 0
+	for _, s := range dnsServers {
+		if written >= 2 {
 			break
+		}
+		if strings.Contains(s, ":") {
+			continue
 		}
 		sb.WriteByte(':')
 		sb.WriteString(s)
+		written++
 	}
 	return sb.String()
 }
