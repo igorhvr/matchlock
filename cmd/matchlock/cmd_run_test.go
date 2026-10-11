@@ -515,6 +515,8 @@ func TestBuildRunNetworkConfigCarriesAllowPrivate(t *testing.T) {
 		[]string{"8.8.8.8"},
 		"demo",
 		1400,
+		false,
+		false,
 	)
 	require.NotNil(t, cfg)
 	assert.Equal(t, []string{"192.168.107.74:8888", "200:1234::1"}, cfg.AllowPrivate)
@@ -524,6 +526,39 @@ func TestBuildRunNetworkConfigCarriesAllowPrivate(t *testing.T) {
 	assert.Equal(t, []string{"api.openai.com"}, cfg.AllowedHosts)
 	assert.True(t, cfg.Intercept)
 	assert.Equal(t, 1400, cfg.MTU)
+	// Neither DNS priority flag given: the config carries the explicit
+	// default, never the empty string.
+	assert.Equal(t, api.DNSPriorityIPv4, cfg.DNSPriority)
+}
+
+// TestBuildRunNetworkConfigDNSPriorityFlags covers the DNS priority
+// pass-through: explicit ipv4, explicit ipv6, and the both-given precedence
+// (ipv6 wins).
+func TestBuildRunNetworkConfigDNSPriorityFlags(t *testing.T) {
+	build := func(prioritizeIPv4, prioritizeIPv6 bool) *api.NetworkConfig {
+		return buildRunNetworkConfig(nil, nil, nil, false, false, nil, nil, "", 1500, prioritizeIPv4, prioritizeIPv6)
+	}
+
+	assert.Equal(t, api.DNSPriorityIPv4, build(false, false).DNSPriority, "default must be ipv4")
+	assert.Equal(t, api.DNSPriorityIPv4, build(true, false).DNSPriority, "--prioritize-ipv4-dns-resolution must select ipv4")
+	assert.Equal(t, api.DNSPriorityIPv6, build(false, true).DNSPriority, "--prioritize-ipv6-dns-resolution must select ipv6")
+	assert.Equal(t, api.DNSPriorityIPv6, build(true, true).DNSPriority, "with both flags given ipv6 must win")
+
+	// Every produced value must pass the shared config validation.
+	require.NoError(t, (&api.Config{Network: build(true, true)}).Validate())
+}
+
+func TestRunDNSPriorityFlagsRegistered(t *testing.T) {
+	ipv4 := runCmd.Flags().Lookup("prioritize-ipv4-dns-resolution")
+	require.NotNil(t, ipv4, "--prioritize-ipv4-dns-resolution must be registered on the run command")
+	assert.Equal(t, "bool", ipv4.Value.Type())
+	assert.Equal(t, "false", ipv4.DefValue)
+
+	ipv6 := runCmd.Flags().Lookup("prioritize-ipv6-dns-resolution")
+	require.NotNil(t, ipv6, "--prioritize-ipv6-dns-resolution must be registered on the run command")
+	assert.Equal(t, "bool", ipv6.Value.Type())
+	assert.Equal(t, "false", ipv6.DefValue)
+	assert.Contains(t, ipv6.Usage, "verbatim", "the ipv6 flag must document that it is a verbatim relay")
 }
 
 func TestRunNoNetworkRejectsAllowPrivate(t *testing.T) {

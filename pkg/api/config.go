@@ -127,6 +127,19 @@ func (r *Resources) Validate() error {
 // DefaultDNSServers are used when no custom DNS servers are configured.
 var DefaultDNSServers = []string{"8.8.8.8", "8.8.4.4"}
 
+// DNS resolution priority values for NetworkConfig.DNSPriority.
+const (
+	// DNSPriorityIPv4 makes the host DNS forwarder prefer IPv4: a standard
+	// AAAA query for a name that demonstrably has an A record is answered
+	// with a synthesized NODATA response, so a dual-stack guest falls back
+	// to IPv4. It is the default.
+	DNSPriorityIPv4 = "ipv4"
+	// DNSPriorityIPv6 relays every DNS answer verbatim. It is verbatim DNS
+	// relay only: it does not force applications to prefer IPv6, and direct
+	// IP-literal connections are unaffected.
+	DNSPriorityIPv6 = "ipv6"
+)
+
 type HostIPMapping struct {
 	Host string `json:"host"`
 	IP   string `json:"ip"`
@@ -149,6 +162,14 @@ type NetworkConfig struct {
 	DNSServers      []string                   `json:"dns_servers,omitempty"`
 	Hostname        string                     `json:"hostname,omitempty"`
 	MTU             int                        `json:"mtu,omitempty"`
+	// DNSPriority selects how the host DNS forwarder treats AAAA answers:
+	// "ipv4" (also the default when unset) answers a standard AAAA query with
+	// a synthesized NODATA response when the name demonstrably has an A
+	// record, so a dual-stack guest resolves and connects over IPv4; "ipv6"
+	// relays every DNS answer verbatim. "ipv6" is verbatim DNS relay only: it
+	// is not "force applications to prefer IPv6", and direct IP-literal
+	// connections are unaffected by either value.
+	DNSPriority string `json:"dns_priority,omitempty"`
 }
 
 // GetDNSServers returns the configured DNS servers or defaults.
@@ -157,6 +178,15 @@ func (n *NetworkConfig) GetDNSServers() []string {
 		return n.DNSServers
 	}
 	return DefaultDNSServers
+}
+
+// GetDNSPriority returns the configured DNS resolution priority, defaulting to
+// "ipv4" when unset.
+func (n *NetworkConfig) GetDNSPriority() string {
+	if n != nil && n.DNSPriority != "" {
+		return n.DNSPriority
+	}
+	return DNSPriorityIPv4
 }
 
 // GetMTU returns the configured network MTU or the default.
@@ -174,6 +204,12 @@ func (n *NetworkConfig) Validate() error {
 	}
 	if err := ValidateSecretPlaceholders(n.Secrets); err != nil {
 		return errx.With(ErrInvalidConfig, ": %v", err)
+	}
+	switch n.DNSPriority {
+	case "", DNSPriorityIPv4, DNSPriorityIPv6:
+	default:
+		return errx.With(ErrInvalidConfig, ": network.dns_priority must be %q or %q (got %q)",
+			DNSPriorityIPv4, DNSPriorityIPv6, n.DNSPriority)
 	}
 	if !n.NoNetwork {
 		return nil

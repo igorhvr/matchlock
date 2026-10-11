@@ -8,9 +8,12 @@ import (
 	"strconv"
 	"testing"
 
+	"github.com/jingkaihe/matchlock/pkg/api"
 	sandboxnet "github.com/jingkaihe/matchlock/pkg/net"
+	"github.com/jingkaihe/matchlock/pkg/policy"
 	"github.com/jingkaihe/matchlock/pkg/state"
 	"github.com/jingkaihe/matchlock/pkg/vm"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -29,16 +32,18 @@ func leasedSubnetInfo(octet int) *state.SubnetInfo {
 	}
 }
 
-// recordingDeps captures the addressing the sandbox hands to the proxy and DNS
-// constructors while still returning live objects: a real proxy bound on
-// loopback (so the ports the ip6 table redirects to are the ports the proxy
-// actually reported) and a real forwarder. The IPv6 bind addresses are recorded
-// rather than bound, because the guest's gateway address does not exist on the
-// host.
+// recordingDeps captures the addressing and configuration the sandbox hands to
+// the proxy and DNS constructors while still returning live objects: a real
+// proxy bound on loopback (so the ports the ip6 table redirects to are the
+// ports the proxy actually reported) and a real, CONFIGURED forwarder (so the
+// priority and the fail-closed matcher the sandbox passes are the ones
+// exercised). The IPv6 bind addresses are recorded rather than bound, because
+// the guest's gateway address does not exist on the host.
 type recordingDeps struct {
 	proxyCfg  *sandboxnet.ProxyConfig
 	dnsV4Addr string
 	dnsV6Addr string
+	dnsCfg    sandboxnet.DNSForwarderConfig
 	proxy     *sandboxnet.TransparentProxy
 }
 
@@ -53,9 +58,13 @@ func (r *recordingDeps) deps() interceptionDeps {
 			r.proxy = p
 			return p, err
 		},
-		newDNS: func(bindAddrV4, bindAddrV6 string, dnsServers []string) (*sandboxnet.DNSForwarder, error) {
-			r.dnsV4Addr, r.dnsV6Addr = bindAddrV4, bindAddrV6
-			return sandboxnet.NewDNSForwarder("127.0.0.1", dnsServers)
+		newDNS: func(bindAddrV4, bindAddrV6 string, dnsServers []string, cfg sandboxnet.DNSForwarderConfig) (*sandboxnet.DNSForwarder, error) {
+			r.dnsV4Addr, r.dnsV6Addr, r.dnsCfg = bindAddrV4, bindAddrV6, cfg
+			// The guest's gateway address does not exist on the host, so the
+			// real forwarder binds loopback instead. The configuration is
+			// forwarded UNCHANGED: the ipv4 mode's fail-closed matcher rule
+			// must apply to the sandbox's wiring exactly as in production.
+			return sandboxnet.NewConfiguredDNSForwarder("127.0.0.1", "", dnsServers, cfg)
 		},
 	}
 }
@@ -82,7 +91,12 @@ func TestInterceptionWiringWiresIPv6ThroughEveryConsumer(t *testing.T) {
 	require.Equal(t, "fd00:100::/64", vmCfg.Subnet6CIDR)
 
 	rec := &recordingDeps{}
-	proxy, dnsForwarder, rules, err := provisionInterception(rec.deps(), w, interceptionInputs{dnsServers: []string{"127.0.0.53"}})
+	policyEngine := policy.NewEngine(&api.NetworkConfig{})
+	proxy, dnsForwarder, rules, err := provisionInterception(rec.deps(), w, interceptionInputs{
+		dnsServers:       []string{"127.0.0.53"},
+		dnsPriority:      api.DNSPriorityIPv4,
+		allowPrivateName: policyEngine.MatchesAllowPrivateName,
+	})
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		require.NoError(t, proxy.Close())
@@ -95,6 +109,15 @@ func TestInterceptionWiringWiresIPv6ThroughEveryConsumer(t *testing.T) {
 	require.Equal(t, "fd00:100::1", rec.proxyCfg.BindAddrV6)
 	require.Equal(t, "192.168.100.1", rec.dnsV4Addr)
 	require.Equal(t, "fd00:100::1", rec.dnsV6Addr)
+
+	// The DNS priority reaches the forwarder constructor and the sandbox
+	// always supplies an explicit allow_private matcher: with an empty
+	// allow_private list it matches nothing, and the rewrite stays enabled
+	// fail-closed.
+	require.Equal(t, api.DNSPriorityIPv4, rec.dnsCfg.DNSPriority)
+	require.NotNil(t, rec.dnsCfg.AllowPrivateName, "the sandbox must always supply an explicit matcher")
+	assert.False(t, rec.dnsCfg.AllowPrivateName("anything.example"),
+		"an empty allow_private list must match no name")
 
 	// The per-TAP ip6 table is pointed at that gateway and at the very ports
 	// the proxy and forwarder reported, which is what makes the ip6 redirect
@@ -152,6 +175,34 @@ func TestInterceptionWiringIPv6OffIsUnchanged(t *testing.T) {
 	})
 }
 
+// TestProvisionInterceptionMissingMatcherFailsClosed proves the sandbox wiring
+// never silently drops the allow_private carve-out: an ipv4-priority
+// interception stack without a name matcher fails construction (the forwarder
+// refuses it) and the already-started proxy is released again.
+func TestProvisionInterceptionMissingMatcherFailsClosed(t *testing.T) {
+	w := newInterceptionWiring(leasedSubnetInfo(103), true)
+	w.tapName = "fc-wiring3"
+	require.True(t, w.interceptionEnabled())
+
+	rec := &recordingDeps{}
+	proxy, dnsForwarder, rules, err := provisionInterception(rec.deps(), w, interceptionInputs{
+		dnsServers:       []string{"127.0.0.53"},
+		dnsPriority:      api.DNSPriorityIPv4,
+		allowPrivateName: nil, // the wiring bug this guards against
+	})
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrCreateProxy)
+	require.Nil(t, proxy)
+	require.Nil(t, dnsForwarder)
+	require.Nil(t, rules)
+
+	// The proxy the sandbox had already started must be closed again.
+	require.NotNil(t, rec.proxy)
+	ln, listenErr := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(rec.proxy.HTTPPort())))
+	require.NoError(t, listenErr, "the proxy's listener must be released on the fail-closed path")
+	require.NoError(t, ln.Close())
+}
+
 // TestProvisionInterceptionFailureReleasesListeners covers the failure path
 // after the listeners exist: when the DNS forwarder cannot be created (its own
 // IPv6 bind failed), the proxy - including its IPv6 listeners - is closed again,
@@ -163,7 +214,7 @@ func TestProvisionInterceptionFailureReleasesListeners(t *testing.T) {
 
 	rec := &recordingDeps{}
 	deps := rec.deps()
-	deps.newDNS = func(bindAddrV4, bindAddrV6 string, dnsServers []string) (*sandboxnet.DNSForwarder, error) {
+	deps.newDNS = func(bindAddrV4, bindAddrV6 string, dnsServers []string, cfg sandboxnet.DNSForwarderConfig) (*sandboxnet.DNSForwarder, error) {
 		require.Equal(t, "fd00:100::1", bindAddrV6)
 		return nil, errors.New("bind [fd00:100::1]:5353: cannot assign requested address")
 	}

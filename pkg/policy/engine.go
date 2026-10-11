@@ -895,6 +895,37 @@ func (e *Engine) allowPrivateNameAddress(ip net.IP, port int) bool {
 	return false
 }
 
+// MatchesAllowPrivateName reports whether host matches an allow_private NAME
+// entry. The queried name is normalized first (lowercase, no trailing dot) and
+// entry names are matched with matchGlob exactly as compiled, consistent with
+// the engine's destination-name matching; the PORT SCOPE of an entry is
+// IGNORED because a DNS query carries no port. Address entries (IP literals,
+// CIDR networks) never match a name.
+//
+// It exists so the sandbox can hand the DNS forwarder's ipv4-preferring AAAA
+// rewrite a fail-closed allow_private carve-out: a name exempted here is
+// relayed verbatim. With no allow_private entries it returns false — the
+// rewrite stays enabled.
+func (e *Engine) MatchesAllowPrivateName(host string) bool {
+	name := normalizeDNSName(host)
+	if name == "" {
+		return false
+	}
+	for _, entry := range e.allowPrivate {
+		if entry.name == "" {
+			continue
+		}
+		// Both sides are normalized (lowercase, no trailing dot) so an entry
+		// written as "Private.Example.COM." matches exactly like the engine's
+		// other name comparisons. The port scope is deliberately not part of
+		// the comparison.
+		if matchGlob(normalizeDNSName(entry.name), name) {
+			return true
+		}
+	}
+	return false
+}
+
 // allowPrivateName reports whether host matches an allow_private name entry with
 // a matching port scope. Name matching uses matchGlob, consistent with
 // AllowedHosts.

@@ -3,10 +3,13 @@
 package net
 
 import (
+	"context"
+	"log/slog"
 	"net"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jingkaihe/matchlock/internal/errx"
@@ -18,9 +21,25 @@ import (
 // IPv6 gateway address as well, on the SAME port: the ip6 nftables table
 // DNATs guest port 53 to the port this forwarder reports through
 // SetDNSForwarderPort, exactly as the ip table does for IPv4, so one port
-// number has to answer for both families. Answers (AAAA included) are relayed
-// verbatim: the forwarder is a transport, not a DNS rewriter, so whatever the
-// upstream returns — record types, flags, TTLs — reaches the guest unchanged.
+// number has to answer for both families. A reply is written back on the
+// socket that received its query.
+//
+// Two answer modes exist:
+//
+//   - Verbatim relay (the legacy NewDNSForwarder and NewDualStackDNSForwarder
+//     constructors, and NewConfiguredDNSForwarder with priority "ipv6"):
+//     whatever the upstream returns — record types, flags, TTLs — reaches the
+//     guest unchanged. "Prioritizing IPv6 DNS resolution" means exactly this
+//     verbatim relay; it does NOT force applications to prefer IPv6, and
+//     direct IP-literal connections are unaffected by either mode.
+//   - ipv4-preferring rewrite (NewConfiguredDNSForwarder with priority
+//     "ipv4", the default): for a standard single-question AAAA query whose
+//     name is not exempted by the allow_private matcher, the forwarder probes
+//     the same upstream list for an A record. When the name demonstrably has
+//     an A record, the guest receives a synthesized NODATA answer (no AAAA
+//     records; unsigned — AD clear) instead of the upstream AAAA answer so a
+//     dual-stack guest falls back to IPv4. Every other query and every other
+//     upstream outcome relays the upstream bytes verbatim.
 type DNSForwarder struct {
 	// conns are the sockets the forwarder reads from, IPv4 first. Dual-stack
 	// mode adds the IPv6 gateway socket bound on the same port. A reply is
@@ -31,6 +50,39 @@ type DNSForwarder struct {
 	dnsServers []string
 	// bindAddrV6 is the configured IPv6 bind address, empty when IPv4-only.
 	bindAddrV6 string
+
+	// mode selects the answer mode: dnsModeVerbatim relays every answer
+	// unchanged; dnsModeIPv4Prefer rewrites eligible AAAA answers (see the
+	// type comment). It is fixed at construction.
+	mode dnsForwardMode
+	// allowPrivateName reports whether a queried name matches an
+	// allow_private entry. Names it matches are relayed verbatim with no
+	// probe. In dnsModeIPv4Prefer it is required at construction (fail
+	// closed); in dnsModeVerbatim it is unused.
+	allowPrivateName func(host string) bool
+
+	// stopCtx is cancelled by Close so an in-flight probe aborts promptly,
+	// including a dial that has not completed yet.
+	stopCtx    context.Context
+	stopCancel context.CancelFunc
+
+	// rewriteMu guards the rewrite cache and the in-flight probe map. No
+	// network I/O ever happens while it is held.
+	rewriteMu sync.Mutex
+	// rewriteCache memoizes A-existence per queried name (see probeAExists).
+	rewriteCache map[string]dnsRewriteCacheEntry
+	// rewriteInflight collapses concurrent probes for the same name into one
+	// upstream query (singleflight).
+	rewriteInflight map[string]*dnsProbeCall
+	// now is the clock the rewrite cache reads. It is a field so tests can
+	// inject a clock; production constructors leave it at time.Now.
+	now func() time.Time
+	// probeSeq numbers A-probe queries so only a response that echoes the
+	// probe's ID is accepted as evidence.
+	probeSeq atomic.Uint32
+	// probeBudget bounds the TOTAL A-probe time across the whole resolver
+	// fallback list; 0 means dnsProbeBudget.
+	probeBudget time.Duration
 
 	requests  chan dnsRequest
 	stopCh    chan struct{}
@@ -78,7 +130,7 @@ func NewDNSForwarder(bindAddr string, dnsServers []string) (*DNSForwarder, error
 	if err != nil {
 		return nil, err
 	}
-	return newDNSForwarder([]*net.UDPConn{conn}, "", dnsServers), nil
+	return newDNSForwarder([]*net.UDPConn{conn}, "", dnsServers, dnsForwarderSettings{mode: dnsForwardModeVerbatim}), nil
 }
 
 // NewDualStackDNSForwarder starts the forwarder on bindAddrV4 and on the SAME
@@ -105,7 +157,51 @@ func NewDualStackDNSForwarder(bindAddrV4, bindAddrV6 string, dnsServers []string
 		return nil, err
 	}
 
-	return newDNSForwarder([]*net.UDPConn{v4, v6}, bindAddrV6, dnsServers), nil
+	return newDNSForwarder([]*net.UDPConn{v4, v6}, bindAddrV6, dnsServers, dnsForwarderSettings{mode: dnsForwardModeVerbatim}), nil
+}
+
+// NewConfiguredDNSForwarder starts the mode-aware forwarder: bindAddrV4 plus —
+// when bindAddrV6 is not empty — bindAddrV6 on the SAME port, exactly like
+// NewDualStackDNSForwarder, but the answer mode comes from cfg. DNSPriority
+// "ipv4" (also the default when empty) enables the ipv4-preferring rewrite of
+// eligible AAAA answers; "ipv6" keeps the verbatim relay (see the DNSForwarder
+// type comment). The ipv4 mode REQUIRES cfg.AllowPrivateName: a nil matcher is
+// rejected here, before any socket is opened, because it would silently drop
+// the allow_private carve-out.
+func NewConfiguredDNSForwarder(bindAddrV4, bindAddrV6 string, dnsServers []string, cfg DNSForwarderConfig) (*DNSForwarder, error) {
+	mode, err := dnsModeForPriority(cfg.DNSPriority)
+	if err != nil {
+		return nil, err
+	}
+	if mode == dnsForwardModeIPv4Prefer && cfg.AllowPrivateName == nil {
+		priority := cfg.DNSPriority
+		if priority == "" {
+			priority = "ipv4"
+		}
+		return nil, errx.With(ErrDNSConfig, ": dns priority %q requires an allow_private name matcher", priority)
+	}
+	if len(dnsServers) == 0 {
+		return nil, errx.With(ErrListen, " no DNS servers configured for forwarder")
+	}
+
+	v4, err := listenDNSAddr(bindAddrV4, 0)
+	if err != nil {
+		return nil, err
+	}
+	conns := []*net.UDPConn{v4}
+	if bindAddrV6 != "" {
+		v6, err := listenDNSAddr(bindAddrV6, v4.LocalAddr().(*net.UDPAddr).Port)
+		if err != nil {
+			_ = v4.Close()
+			return nil, err
+		}
+		conns = append(conns, v6)
+	}
+
+	return newDNSForwarder(conns, bindAddrV6, dnsServers, dnsForwarderSettings{
+		mode:             mode,
+		allowPrivateName: cfg.AllowPrivateName,
+	}), nil
 }
 
 // listenDNSAddr opens a UDP socket for one bind address literal on port (0 =
@@ -139,14 +235,32 @@ func dnsBindHost(bindAddr string) string {
 	return bindAddr
 }
 
-func newDNSForwarder(conns []*net.UDPConn, bindAddrV6 string, dnsServers []string) *DNSForwarder {
+// newDNSForwarder wires the sockets, the answer mode from settings and the
+// worker pool. dnsServers is snapshotted here, and never mutated afterwards,
+// so the rewrite cache is scoped to exactly one immutable resolver list (a
+// name's verdict is never reused across differently-configured forwarders).
+func newDNSForwarder(conns []*net.UDPConn, bindAddrV6 string, dnsServers []string, settings dnsForwarderSettings) *DNSForwarder {
+	stopCtx, stopCancel := context.WithCancel(context.Background())
 	d := &DNSForwarder{
-		conns:      conns,
-		dnsServers: append([]string(nil), dnsServers...),
-		bindAddrV6: bindAddrV6,
-		requests:   make(chan dnsRequest, dnsQueueSize),
-		stopCh:     make(chan struct{}),
-		upstreams:  make(map[net.Conn]struct{}),
+		conns:            conns,
+		dnsServers:       append([]string(nil), dnsServers...),
+		bindAddrV6:       bindAddrV6,
+		mode:             settings.mode,
+		allowPrivateName: settings.allowPrivateName,
+		stopCtx:          stopCtx,
+		stopCancel:       stopCancel,
+		rewriteCache:     make(map[string]dnsRewriteCacheEntry),
+		rewriteInflight:  make(map[string]*dnsProbeCall),
+		now:              settings.now,
+		probeBudget:      settings.probeBudget,
+		requests:         make(chan dnsRequest, dnsQueueSize),
+		stopCh:           make(chan struct{}),
+		upstreams:        make(map[net.Conn]struct{}),
+	}
+	if settings.now != nil {
+		d.now = settings.now
+	} else {
+		d.now = time.Now
 	}
 	for _, conn := range conns {
 		d.wg.Add(1)
@@ -175,6 +289,10 @@ func (d *DNSForwarder) BindAddrV6() string {
 func (d *DNSForwarder) Close() error {
 	d.closeOnce.Do(func() {
 		close(d.stopCh)
+		// Cancel the stop context too: this aborts a probe dial that has not
+		// completed yet (the sockets a probe already connected are released
+		// by closeUpstreams below), so Close never waits on the probe budget.
+		d.stopCancel()
 		for _, conn := range d.conns {
 			_ = conn.Close()
 		}
@@ -231,18 +349,39 @@ func (d *DNSForwarder) forward(req dnsRequest) {
 			return
 		}
 
-		// The response is relayed exactly as received (AAAA records included)
-		// and written back on the socket the query arrived on.
-		_, _ = req.conn.WriteToUDP(resp, req.clientAddr)
+		// The answer is written back on the socket the query arrived on:
+		// verbatim by default, or through the ipv4-preferring AAAA rewrite
+		// when that mode is active (every failure inside the rewrite relays
+		// the upstream bytes verbatim).
+		_, _ = req.conn.WriteToUDP(d.maybeRewriteAAAA(req.query, resp), req.clientAddr)
 		return
 	}
+	// Every upstream server failed on transport: there is no response to
+	// relay and none is fabricated (the rewrite never runs without upstream
+	// bytes, so it cannot synthesize evidence of its own). The guest sees a
+	// DNS timeout and retries, exactly as before.
+	slog.Debug("DNS query failed on every upstream server; no answer sent", "servers", d.dnsServers)
 }
 
 func (d *DNSForwarder) exchange(query []byte, server string) ([]byte, error) {
+	return d.exchangeUntil(query, server, time.Now().Add(dnsUpstreamTimeout))
+}
+
+// exchangeUntil is exchange under one ABSOLUTE deadline (and the forwarder's
+// stop context): it is the transport of the A-existence probe, whose total
+// budget covers every dial and every socket wait across the whole resolver
+// fallback list. The connection is registered in d.upstreams like any other
+// upstream, so Close releases a probe blocked in Read, and the dial itself
+// aborts the moment the forwarder stops.
+func (d *DNSForwarder) exchangeUntil(query []byte, server string, deadline time.Time) ([]byte, error) {
 	if d.isStopping() {
 		return nil, net.ErrClosed
 	}
-	upstream, err := net.DialTimeout("udp", dnsServerAddr(server), dnsUpstreamTimeout)
+	dialCtx, cancel := context.WithDeadline(d.stopCtx, deadline)
+	defer cancel()
+
+	var dialer net.Dialer
+	upstream, err := dialer.DialContext(dialCtx, "udp", dnsServerAddr(server))
 	if err != nil {
 		return nil, err
 	}
@@ -253,7 +392,11 @@ func (d *DNSForwarder) exchange(query []byte, server string) ([]byte, error) {
 	defer d.untrackUpstream(upstream)
 	defer upstream.Close()
 
-	_ = upstream.SetDeadline(time.Now().Add(dnsUpstreamTimeout))
+	// The deadline is the probe's enforcement point: a failure to install it
+	// must surface as a transport error, not as an unbounded wait.
+	if err := upstream.SetDeadline(deadline); err != nil {
+		return nil, err
+	}
 	if _, err := upstream.Write(query); err != nil {
 		return nil, err
 	}
@@ -263,7 +406,6 @@ func (d *DNSForwarder) exchange(query []byte, server string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-
 	return resp[:n], nil
 }
 

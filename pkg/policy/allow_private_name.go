@@ -97,8 +97,35 @@ func compileAllowPrivateNames(entries []allowPrivateEntry) []string {
 // normalizeDNSName canonicalizes a host name (lowercase, no trailing root dot,
 // no surrounding whitespace) so an allow_private entry, an add_hosts mapping
 // and a DNS answer key compare equal regardless of how they were written.
+//
+// The case fold is ASCII-only (RFC 4343), deliberately using the same folding
+// rule as the DNS rewrite's canonicalDNSName (pkg/net/dns_rewrite.go); the two
+// packages keep separate implementations, and this normalizer additionally
+// trims surrounding whitespace and the trailing root dot. Unicode folding
+// (strings.ToLower) collapses byte-distinct host names onto one identity, so
+// without this alignment a name the rewrite keeps distinct could have matched —
+// or failed to match — an allow_private entry meant for another name.
 func normalizeDNSName(name string) string {
-	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(name)), ".")
+	return strings.TrimSuffix(asciiLower(strings.TrimSpace(name)), ".")
+}
+
+// asciiLower folds ASCII 'A'-'Z' to 'a'-'z' and preserves every other byte.
+// DNS case-insensitivity is ASCII-only (RFC 4343); this is the same rule the
+// DNS rewrite applies to wire names, so both sides of a name comparison share
+// one identity notion.
+func asciiLower(name string) string {
+	folded := []byte(name)
+	modified := false
+	for i, b := range folded {
+		if b >= 'A' && b <= 'Z' {
+			folded[i] = b + ('a' - 'A')
+			modified = true
+		}
+	}
+	if !modified {
+		return name
+	}
+	return string(folded)
 }
 
 // nameEntryAddresses returns the address set the allow_private NAME entry name

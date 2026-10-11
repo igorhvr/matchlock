@@ -146,14 +146,14 @@ func (w interceptionWiring) firewallTableV6() string {
 // VM, a TAP or root privileges.
 type interceptionDeps struct {
 	newProxy func(*sandboxnet.ProxyConfig) (*sandboxnet.TransparentProxy, error)
-	newDNS   func(bindAddrV4, bindAddrV6 string, dnsServers []string) (*sandboxnet.DNSForwarder, error)
+	newDNS   func(bindAddrV4, bindAddrV6 string, dnsServers []string, cfg sandboxnet.DNSForwarderConfig) (*sandboxnet.DNSForwarder, error)
 }
 
 // defaultInterceptionDeps wires the production constructors.
 func defaultInterceptionDeps() interceptionDeps {
 	return interceptionDeps{
 		newProxy: sandboxnet.NewTransparentProxy,
-		newDNS:   sandboxnet.NewDualStackDNSForwarder,
+		newDNS:   sandboxnet.NewConfiguredDNSForwarder,
 	}
 }
 
@@ -163,6 +163,14 @@ type interceptionInputs struct {
 	events     chan api.Event
 	caPool     *sandboxnet.CAPool
 	dnsServers []string
+	// dnsPriority is the sandbox's DNS resolution priority
+	// (network.dns_priority, "ipv4" by default); allowPrivateName is the
+	// policy engine's allow_private name matcher. Both reach the DNS
+	// forwarder constructor so the ipv4-preferring rewrite is enabled with
+	// its carve-out fail-closed — the sandbox ALWAYS supplies an explicit
+	// matcher, even when there are no allow_private entries.
+	dnsPriority      string
+	allowPrivateName func(string) bool
 }
 
 // provisionInterception builds and starts the interception stack for one VM:
@@ -189,7 +197,10 @@ func provisionInterception(deps interceptionDeps, w interceptionWiring, in inter
 	}
 	proxy.Start()
 
-	dnsForwarder, err = deps.newDNS(w.gatewayIPv4, w.gatewayIPv6, in.dnsServers)
+	dnsForwarder, err = deps.newDNS(w.gatewayIPv4, w.gatewayIPv6, in.dnsServers, sandboxnet.DNSForwarderConfig{
+		DNSPriority:      in.dnsPriority,
+		AllowPrivateName: in.allowPrivateName,
+	})
 	if err != nil {
 		proxy.Close()
 		return nil, nil, nil, errx.Wrap(ErrCreateProxy, err)
@@ -507,6 +518,12 @@ func New(ctx context.Context, config *api.Config, opts *Options) (sb *Sandbox, r
 			events:     events,
 			caPool:     caPool,
 			dnsServers: config.Network.GetDNSServers(),
+			// The DNS priority comes from the config ("ipv4" by default) and
+			// the allow_private matcher from the policy engine, always
+			// non-nil: an empty allow_private list yields a matcher that
+			// returns false.
+			dnsPriority:      config.Network.GetDNSPriority(),
+			allowPrivateName: policyEngine.MatchesAllowPrivateName,
 		})
 		if err != nil {
 			machine.Close(ctx)

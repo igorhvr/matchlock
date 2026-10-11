@@ -134,6 +134,8 @@ func init() {
 	runCmd.Flags().String("kernel", "", "Guest kernel ref: file:///absolute/path or OCI image reference")
 	runCmd.Flags().StringSlice("allow-host", nil, "Allowed hosts (can be repeated)")
 	runCmd.Flags().StringArray("allow-private", nil, "Allow an otherwise-blocked private destination (host, IP or CIDR with optional :port; repeatable)")
+	runCmd.Flags().Bool("prioritize-ipv4-dns-resolution", false, "Prefer IPv4 for DNS resolution (default): standard AAAA queries for names that resolve over IPv4 are answered with no AAAA records")
+	runCmd.Flags().Bool("prioritize-ipv6-dns-resolution", false, "Relay all DNS answers verbatim so the guest keeps IPv6 answers as received (takes precedence over --prioritize-ipv4-dns-resolution)")
 	runCmd.Flags().StringSlice("add-host", nil, "Add a custom host-to-IP mapping (host:ip, can be repeated)")
 	runCmd.Flags().StringArrayP("volume", "v", nil, fmt.Sprintf("Volume mount, repeatable (host:guest = overlay snapshot by default; use :%s for direct rw host mount, :%s for read-only host mount; host_fs supports uid/gid owner options)", api.MountTypeHostFS, api.MountOptionReadonlyShort))
 	runCmd.Flags().StringArray("disk", nil, "Attach raw ext4 disk image (host_path:guest_mount[:option[,option...]] or @volume_name:guest_mount[:option[,option...]])")
@@ -217,6 +219,10 @@ func buildRunResources(cpus float64, memoryMB, diskSizeMB, timeoutSeconds, swapM
 // explicit exemption list, so CLI runs never disable the private block. Keeping
 // this separate makes the flag -> api.NetworkConfig wiring testable without
 // booting a sandbox.
+//
+// prioritizeIPv4DNS/prioritizeIPv6DNS are the DNS resolution priority flags;
+// when both are given IPv6 wins, and when neither is given the config carries
+// the explicit default "ipv4".
 func buildRunNetworkConfig(
 	allowHosts []string,
 	addHosts []api.HostIPMapping,
@@ -227,7 +233,12 @@ func buildRunNetworkConfig(
 	dnsServers []string,
 	hostname string,
 	mtu int,
+	prioritizeIPv4DNS, prioritizeIPv6DNS bool,
 ) *api.NetworkConfig {
+	dnsPriority := api.DNSPriorityIPv4
+	if prioritizeIPv6DNS {
+		dnsPriority = api.DNSPriorityIPv6
+	}
 	return &api.NetworkConfig{
 		AllowedHosts:    allowHosts,
 		AddHosts:        addHosts,
@@ -239,6 +250,7 @@ func buildRunNetworkConfig(
 		DNSServers:      dnsServers,
 		Hostname:        hostname,
 		MTU:             mtu,
+		DNSPriority:     dnsPriority,
 	}
 }
 
@@ -291,6 +303,8 @@ func runRun(cmd *cobra.Command, args []string) error {
 	networkMTU, _ := cmd.Flags().GetInt("mtu")
 	noNetwork, _ := cmd.Flags().GetBool("no-network")
 	networkIntercept, _ := cmd.Flags().GetBool("network-intercept")
+	prioritizeIPv4DNS, _ := cmd.Flags().GetBool("prioritize-ipv4-dns-resolution")
+	prioritizeIPv6DNS, _ := cmd.Flags().GetBool("prioritize-ipv6-dns-resolution")
 	publishSpecs, _ := cmd.Flags().GetStringArray("publish")
 	addresses, _ := cmd.Flags().GetStringSlice("address")
 
@@ -484,6 +498,8 @@ func runRun(cmd *cobra.Command, args []string) error {
 			dnsServers,
 			hostname,
 			networkMTU,
+			prioritizeIPv4DNS,
+			prioritizeIPv6DNS,
 		),
 		VFS:        vfsConfig,
 		Env:        parsedEnv,
