@@ -16,6 +16,51 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// joinPassthrough starts tp.handlePassthrough on conn and joins the handler
+// before the test ends. The join is load-bearing for the race detector: a
+// handler still running when the test returns reads net.DefaultResolver (via
+// net.Dial) without ordering against a later test that swaps the resolver
+// (the synthetic-DNS tests do exactly that).
+func joinPassthrough(t *testing.T, tp *TransparentProxy, conn net.Conn, dstIP string, dstPort int) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		tp.handlePassthrough(conn, dstIP, dstPort)
+	}()
+	t.Cleanup(func() {
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Error("passthrough handler did not exit before test end")
+		}
+	})
+}
+
+// joinAcceptPassthrough accepts one connection on ln, runs
+// tp.handlePassthrough on it, and joins the handler before the test ends
+// (closing the listener first so a missing client cannot leave Accept blocked).
+func joinAcceptPassthrough(t *testing.T, ln net.Listener, tp *TransparentProxy, dstIP string, dstPort int) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		tp.handlePassthrough(c, dstIP, dstPort)
+	}()
+	t.Cleanup(func() {
+		_ = ln.Close()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Error("passthrough accept handler did not exit before test end")
+		}
+	})
+}
+
 func TestHandlePassthrough_Allowed(t *testing.T) {
 	upstream := startEchoServer(t)
 	defer upstream.Close()
@@ -32,7 +77,7 @@ func TestHandlePassthrough_Allowed(t *testing.T) {
 
 	_, portStr, _ := net.SplitHostPort(upstream.Addr().String())
 
-	go tp.handlePassthrough(server, "127.0.0.1", mustAtoi(portStr))
+	joinPassthrough(t, tp, server, "127.0.0.1", mustAtoi(portStr))
 
 	msg := []byte("hello passthrough")
 	client.SetWriteDeadline(time.Now().Add(2 * time.Second))
@@ -93,7 +138,7 @@ func TestHandlePassthrough_EmptyAllowlist(t *testing.T) {
 
 	_, portStr, _ := net.SplitHostPort(upstream.Addr().String())
 
-	go tp.handlePassthrough(server, "127.0.0.1", mustAtoi(portStr))
+	joinPassthrough(t, tp, server, "127.0.0.1", mustAtoi(portStr))
 
 	msg := []byte("open policy")
 	client.SetWriteDeadline(time.Now().Add(2 * time.Second))
@@ -198,7 +243,7 @@ func TestHandlePassthrough_DialsLiteralOriginalDst(t *testing.T) {
 		"203.0.113.99.": {{"127.0.0.1"}},
 	})
 	dns.install()
-	defer dns.uninstall()
+	t.Cleanup(dns.uninstall)
 
 	upstream := startEchoServer(t)
 	defer upstream.Close()
@@ -219,7 +264,7 @@ func TestHandlePassthrough_DialsLiteralOriginalDst(t *testing.T) {
 	client, server := net.Pipe()
 	defer client.Close()
 
-	go tp.handlePassthrough(server, "203.0.113.99", mustAtoi(portStr))
+	joinPassthrough(t, tp, server, "203.0.113.99", mustAtoi(portStr))
 
 	msg := []byte("hello passthrough")
 	client.SetWriteDeadline(time.Now().Add(2 * time.Second))
@@ -291,13 +336,7 @@ func TestHandlePassthrough_ClientHalfCloseDeliversResponse(t *testing.T) {
 		},
 	}
 
-	go func() {
-		c, err := front.Accept()
-		if err != nil {
-			return
-		}
-		tp.handlePassthrough(c, "127.0.0.1", mustAtoi(upstreamPort))
-	}()
+	joinAcceptPassthrough(t, front, tp, "127.0.0.1", mustAtoi(upstreamPort))
 
 	client, err := net.Dial("tcp", front.Addr().String())
 	require.NoError(t, err)
