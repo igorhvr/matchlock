@@ -159,6 +159,16 @@ func isSandboxLauncher() bool {
 // runSandboxLauncher is the entrypoint for the re-execed process.
 // It drops capabilities, installs seccomp, then execs the real command.
 func runSandboxLauncher() {
+	// Pin this goroutine to its OS thread before any per-thread security state
+	// is installed below (capability-bounding drops, no_new_privs, seccomp).
+	// Those prctls affect only the calling thread, while syscall.Exec runs on
+	// whichever thread the goroutine currently occupies, so a migration would
+	// exec on a thread that never received the restrictions. Keep pinned through
+	// exec; never UnlockOSThread: every path out of this function is terminal
+	// (syscall.Exec or os.Exit) and Go's contract forbids unlocking a thread
+	// carrying permanent per-thread state changes.
+	runtime.LockOSThread()
+
 	// Remove our marker so child doesn't inherit it
 	os.Unsetenv(sandboxLauncherEnvKey)
 
