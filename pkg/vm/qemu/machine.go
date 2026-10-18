@@ -32,7 +32,34 @@ const (
 	vsockPortVFS   = 5001
 	vsockPortReady = 5002
 	startupTimeout = 180 * time.Second
-	stopGrace      = 5 * time.Second
+
+	// stopGrace is how long Stop waits for a graceful exit before sending SIGKILL.
+	stopGrace = 5 * time.Second
+
+	// stopConfirm bounds the wait, after SIGKILL, for the process to be reaped, on
+	// both shutdown paths.
+	//
+	// Earlier observation (EXP-QEMU-DEATH-1, QEMU/TCG): the former 2s bound expired
+	// while the QEMU process was still alive, with the process disappearing several
+	// seconds after Stop had already reported `stop qemu: timed out`. This window
+	// allows more bounded time for that case. It does NOT establish why the process
+	// took longer than the old window; the cause remains open (tamandua-5rr.8.3).
+	//
+	// What is waited for matters: done closes when cmd.Wait returns, which can include
+	// the os/exec stream-copy work, not only process exit. Whichever of the two was
+	// slow benefits from more time, and neither is guaranteed to finish.
+	//
+	// Note also that Close continues releasing the remaining resources even when Stop
+	// reports failure, so this window does not by itself gate cleanup. A recorded
+	// failure therefore means "termination was not confirmed", not "cleanup was
+	// withheld"; failure-path resource state is asserted explicitly in tests.
+	//
+	// Timing budget for tamandua: stopGrace+stopConfirm = 35s for the Stop phase. That
+	// is NOT a bound on the whole close RPC, which also performs relay shutdown,
+	// forwarding cleanup and sandbox teardown either side of this call, against a 40s
+	// client wire deadline (timeout_seconds=30 + closeGraceMs=10s). The end-to-end
+	// total is measured during acceptance (tamandua-joc), not assumed to fit.
+	stopConfirm = 30 * time.Second
 )
 
 func runtimeGOARCH() string { return runtime.GOARCH }
@@ -820,6 +847,13 @@ func (m *Machine) ExecInteractive(ctx context.Context, command string, opts *api
 // wait uses the fixed stopGrace, and the caller's context only requests an
 // immediate kill on cancellation.
 func (m *Machine) Stop(ctx context.Context) error {
+	return m.stopWith(ctx, stopGrace, stopConfirm)
+}
+
+// stopWith is Stop with the shutdown windows supplied explicitly, so tests can
+// exercise every path (grace expiry, delayed reaping, cancellation at each stage)
+// without real-time sleeps or mutable package state. Production callers use Stop.
+func (m *Machine) stopWith(ctx context.Context, grace, confirm time.Duration) error {
 	// Fast path: if QEMU already exited before we signalled it, accept the exit
 	// (it ran and stopped) and report nil unless there was a real crash. Do this
 	// under the mutex so the "already done" check and any concurrent Close do
@@ -847,22 +881,42 @@ func (m *Machine) Stop(ctx context.Context) error {
 	select {
 	case <-m.done:
 		return m.stopOutcome()
-	case <-time.After(stopGrace):
+	case <-time.After(grace):
 		killChildProcess(pid)
-		select {
-		case <-m.done:
-			return m.stopOutcome()
-		case <-time.After(2 * time.Second):
-			return errx.Wrap(ErrStop, fmt.Errorf("timed out"))
-		}
+		return m.confirmExit(confirm, errx.Wrap(ErrStop, fmt.Errorf("timed out")))
 	case <-ctx.Done():
 		killChildProcess(pid)
+		return m.confirmExit(confirm, ctx.Err())
+	}
+}
+
+// confirmExit waits up to limit for the process to be reaped after SIGKILL.
+//
+// It returns nil only when m.done has closed and the recorded wait error is an
+// intentional signal death (see stopOutcome); otherwise it returns onTimeout. A
+// process that is still not reaped within limit is always an error: this helper
+// never turns "still running" into success. It also does not consult the caller's
+// context — by the time this runs the kill has been sent on both paths, and the
+// window is what bounds the wait.
+func (m *Machine) confirmExit(limit time.Duration, onTimeout error) error {
+	timer := time.NewTimer(limit)
+	defer timer.Stop()
+	// Re-check completion without blocking on the timeout path: Go's select does not
+	// prioritise a ready channel over a ready timer, so a completion landing at the
+	// boundary must not be reported as a failure.
+	settle := func() error {
 		select {
 		case <-m.done:
 			return m.stopOutcome()
-		case <-time.After(2 * time.Second):
-			return ctx.Err()
+		default:
+			return onTimeout
 		}
+	}
+	select {
+	case <-m.done:
+		return m.stopOutcome()
+	case <-timer.C:
+		return settle()
 	}
 }
 
