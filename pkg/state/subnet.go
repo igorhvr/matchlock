@@ -233,7 +233,7 @@ func (a *SubnetAllocator) Get(vmID string) (*SubnetInfo, error) {
 		`SELECT octet, gateway_ip, guest_ip, subnet, gateway_ip6, guest_ip6, subnet6, vm_id
 		 FROM subnet_allocations WHERE vm_id = ?`, vmID)
 	var (
-		info                        SubnetInfo
+		info                         SubnetInfo
 		gatewayIPv6, guestIPv6, sub6 sql.NullString
 	)
 	if err := row.Scan(

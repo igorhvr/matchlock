@@ -67,9 +67,9 @@ func TestSelectDeadAcceptRules_LiveTapNeverDeleted(t *testing.T) {
 
 func TestSelectDeadAcceptRules_NonMatchlockIgnored(t *testing.T) {
 	rules := []*nftables.Rule{
-		{UserData: []byte("docker-return")},        // docker's own rule -> keep
-		{UserData: []byte("some-other-rule")},       // unrelated -> keep
-		acceptRule(net.TapAcceptMarker("dead")),     // dead + in scope -> delete
+		{UserData: []byte("docker-return")},     // docker's own rule -> keep
+		{UserData: []byte("some-other-rule")},   // unrelated -> keep
+		acceptRule(net.TapAcceptMarker("dead")), // dead + in scope -> delete
 	}
 	out := selectDeadAcceptRules(aliveOf(), scopeOf("dead"), rules)
 	require.Len(t, out, 1)
@@ -78,9 +78,9 @@ func TestSelectDeadAcceptRules_NonMatchlockIgnored(t *testing.T) {
 
 func TestSelectDeadAcceptRules_EmptyAndMisnamedIgnored(t *testing.T) {
 	rules := []*nftables.Rule{
-		{UserData: []byte("")},                         // empty marker -> keep
-		acceptRule("matchlock-tap-accept:"),            // empty tap -> keep
-		acceptRule("matchlock-tap-accept:vm-gone"),     // dead + in scope -> delete
+		{UserData: []byte("")},                     // empty marker -> keep
+		acceptRule("matchlock-tap-accept:"),        // empty tap -> keep
+		acceptRule("matchlock-tap-accept:vm-gone"), // dead + in scope -> delete
 	}
 	out := selectDeadAcceptRules(aliveOf(), scopeOf("vm-gone"), rules)
 	require.Len(t, out, 1)
