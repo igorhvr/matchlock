@@ -439,6 +439,18 @@ traffic is policed by the same proxy, the same DNS forwarder and the same policy
 engine that handle IPv4. The allow-list, `block_private_ips` and `allow_private`
 decisions are identical for IPv6 destinations.
 
+On macOS the same interception stack now provisions IPv6 as well: an intercepted guest
+receives a unique-local IPv6 /64 and a default route next to its IPv4 link, and its IPv6
+traffic is policed by the same proxy, DNS forwarder and policy engine. The allow-list,
+`block_private_ips` and `allow_private` decisions apply to IPv6 destinations exactly as
+they do on Linux, and the DNS-priority behaviour below is applied by the macOS resolver
+too.
+
+The plain-NAT mode (no `--network-intercept`, no allow-list, no secrets) is out of scope
+here and **unqualified**: a NAT guest has been observed to receive a unique-local IPv6
+address, but whether it has working IPv6 egress was not established, and it has none of
+the interception stack's policy enforcement. `--no-network` creates no interface at all.
+
 Guest link:
 
 - Every VM is leased a unique-local IPv6 /64 next to its IPv4 /24, derived from
@@ -449,8 +461,13 @@ Guest link:
   TAP, and `guest-init` configures the guest address and its `::/0` route from
   the `matchlock.ipv6=<guest>/<prefix>,<gateway>` kernel cmdline field, because
   the kernel's `ip=` boot argument only configures IPv4.
-- The link exists only when interception is active; a plain NAT sandbox and a
-  `--no-network` sandbox stay IPv4-only.
+- The link exists only when interception is active; the plain-NAT branch is out of scope
+  and unqualified (see above), and `--no-network` creates no interface at all.
+- On macOS the same lease is applied differently: there is no TAP, so the gateway
+  address and the `::/0` route live on the gVisor NIC inside the interception stack
+  rather than on a host interface, and the guest learns its address and route from the
+  same `matchlock.ipv6=` cmdline field. The virtual gateway is never assigned to a macOS
+  host interface.
 
 Interception:
 
@@ -467,10 +484,16 @@ Interception:
   IPv6 path around the proxy. It is fail closed: if the `ip6` table cannot be
   installed, sandbox creation fails instead of running with a half-applied
   policy.
-- IPv6 names resolve through the same DNS forwarder, which relays AAAA answers
-  unchanged; a name that resolves only to an unlisted private IPv6 address is
-  still refused. An `allow_private` name entry covers the AAAA addresses the name
-  resolves to exactly like its A records.
+- IPv6 names resolve through the same DNS forwarder. DNS answers are
+  IPv4-preferring by default: a standard AAAA query for a name that demonstrably
+  has an A record is answered with a synthesized NODATA response, so a dual-stack
+  guest resolves and connects over IPv4. Pass `--prioritize-ipv6-dns-resolution`
+  to relay every answer verbatim instead (verbatim relay only — it does not force
+  applications to prefer IPv6, and IP-literal connections are unaffected either
+  way); `--prioritize-ipv4-dns-resolution` states the default explicitly. A name
+  that resolves only to an unlisted private IPv6 address is still refused, and an
+  `allow_private` name entry covers the AAAA addresses the name resolves to
+  exactly like its A records.
 
 Private IPv6 destinations are blocked by default just like IPv4 ones — exempt
 individual endpoints with `--allow-private` while the block stays on:
@@ -521,7 +544,7 @@ graph LR
 | Linux (QEMU TCG) | Transparent proxy | nftables DNAT on ports 80/443; guest on a TAP device with a static IP |
 | Linux (Firecracker / QEMU TCG) | Transparent proxy over IPv6 | ip6 nftables DNAT of 80/443, catch-all TCP and DNS to the same proxy/DNS forwarder; all other guest IPv6 dropped |
 | macOS | NAT (default) | Virtualization.framework built-in NAT |
-| macOS | Interception (with `--allow-host`/`--secret`) | gVisor userspace TCP/IP at L4 |
+| macOS | Interception (with `--allow-host`/`--secret`/`--network-intercept`) | gVisor userspace TCP/IP at L4, IPv4 and IPv6 |
 
 ## Docs
 
